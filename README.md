@@ -3,9 +3,7 @@
 
 # ETHOS-ARES ICU — Fork
 
-This is a research fork of [ipolharvard/ethos-ares](https://github.com/ipolharvard/ethos-ares),
-developed as part of PhD research on self-supervised learning for intensive care medicine at
-the Medical University of Vienna. The focus is on training and evaluating ETHOS on
+This is a research fork of [ipolharvard/ethos-ares](https://github.com/ipolharvard/ethos-ares). The focus is on training and evaluating ETHOS on
 ICU-only patient cohorts (MIMIC-IV ICU) rather than the full MIMIC-IV-ED population used in the
 original paper.
 
