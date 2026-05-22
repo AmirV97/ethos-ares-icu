@@ -21,6 +21,7 @@ def estimate_loss(
         losses = th.empty(eval_iters, device=model.device)
         for i, (X, Y) in zip(range(eval_iters), dataloader):
             with ctx:
+                th.compiler.cudagraph_mark_step_begin()
                 if isinstance(X, tuple):
                     output = model(input_ids=X[0], decoder_input_ids=X[1], labels=Y)
                 else:

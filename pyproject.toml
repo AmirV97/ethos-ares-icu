@@ -44,6 +44,7 @@ jupyter = ["jupyter", "seaborn", "scikit-learn", "matplotlib", "pandas", "altair
 ethos_tokenize = "ethos.tokenize.run_tokenization:main"
 ethos_train = "ethos.train.run_training:main"
 ethos_infer = "ethos.inference.run_inference:main"
+ethos_fast_eval = "ethos.inference.fast_eval:main"
 
 [tool.setuptools.package-data]
 ethos = ["tokenize/maps/*.csv.gz"]

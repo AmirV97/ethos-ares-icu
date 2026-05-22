@@ -14,8 +14,10 @@ from transformers import BertConfig, EncoderDecoderConfig, EncoderDecoderModel, 
 
 from ..datasets import TimelineDataset
 from ..model import GPT2LMNoBiasModel
+from ..model_new import ModernGPTModel
 from ..utils import load_model_checkpoint, setup_torch
 from .metrics import estimate_loss
+from .optimizer_new import configure_optimizers_muon
 from .utils import ModelType, configure_optimizers, estimate_mfu, get_lr, make_infinite_loader
 
 
@@ -113,12 +115,17 @@ def main(cfg: DictConfig):
         return x.to(device, non_blocking=True), y
 
     iter_num, best_val_loss, best_metric_score, optimizer_state, wandb_path = 0, 1e9, 0, None, None
+    early_stopping_bad_eval_count, early_stopping_best_val_loss = 0, best_val_loss
     if cfg.resume:
         model_fp = out_dir / "recent_model.pt"
         logger.info(f"Resuming from the most recent model: {model_fp}")
         raw_model, checkpoint = load_model_checkpoint(model_fp, map_location=device)
         iter_num = checkpoint["iter_num"]
         best_val_loss = checkpoint["best_val_loss"]
+        early_stopping_bad_eval_count = checkpoint.get("early_stopping_bad_eval_count", 0)
+        early_stopping_best_val_loss = checkpoint.get(
+            "early_stopping_best_val_loss", best_val_loss
+        )
         best_metric_score = checkpoint["best_metric_score"]
         optimizer_state = checkpoint["optimizer"]
         wandb_path = checkpoint["wandb_path"]
@@ -153,6 +160,9 @@ def main(cfg: DictConfig):
             )
             config = EncoderDecoderConfig.from_encoder_decoder_configs(encoder_config, config)
             raw_model = EncoderDecoderModel(config=config)
+        elif cfg.use_modern_arch:
+            config.n_kv_head = cfg.n_kv_head if cfg.n_kv_head > 0 else cfg.n_head
+            raw_model = ModernGPTModel(config)
         else:
             raw_model = GPT2LMNoBiasModel(config)
 
@@ -164,9 +174,15 @@ def main(cfg: DictConfig):
     # initialize a GradScaler. If enabled=False scaler is a no-op
     scaler = th.amp.GradScaler(enabled=(cfg.dtype == "float16"))
     # optimizer
-    optimizer = configure_optimizers(
-        raw_model, cfg.weight_decay, cfg.lr, (cfg.beta1, cfg.beta2), device
-    )
+    if cfg.use_modern_arch:
+        optimizer = configure_optimizers_muon(
+            raw_model, cfg.weight_decay, cfg.lr, (cfg.beta1, cfg.beta2), device,
+            muon_lr=cfg.muon_lr, muon_momentum=cfg.muon_momentum,
+        )
+    else:
+        optimizer = configure_optimizers(
+            raw_model, cfg.weight_decay, cfg.lr, (cfg.beta1, cfg.beta2), device
+        )
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
 
@@ -174,7 +190,7 @@ def main(cfg: DictConfig):
     if master_process:
         logger.info(f"Number of parameters: {num_params / 1e6:.2f}M")
         logger.info(("Not c" if cfg.no_compile else "C") + "ompiling the model...")
-    model = th.compile(raw_model, disable=cfg.no_compile)
+    model = th.compile(raw_model, disable=cfg.no_compile, backend=cfg.compile_backend)
 
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
@@ -183,6 +199,11 @@ def main(cfg: DictConfig):
     online_logger, wandb_run = None, None
     if cfg.wandb_log and master_process:
         import wandb
+
+        # Set WANDB_API_KEY from a local key file if the env var is not already set
+        api_key_fp = Path(os.environ.get("WANDB_KEY_FILE", "wandb.key"))
+        if api_key_fp.exists() and "WANDB_API_KEY" not in os.environ:
+            os.environ["WANDB_API_KEY"] = api_key_fp.read_text().strip()
 
         cfg_dict = OmegaConf.to_container(cfg, resolve=True)
         dataset_name = Path(cfg.data_fp).parts[-2]
@@ -200,9 +221,10 @@ def main(cfg: DictConfig):
             project=cfg.wandb_project,
             name=cfg.wandb_run_name,
             config=cfg_dict,
-            tags=[dataset_name],
+            tags=[dataset_name] + list(cfg.wandb_tags),
             resume_from=f"{run_id}?_step={iter_num}" if run_id is not None else None,
         )
+        wandb.watch(model, log="all", log_freq=100)
         online_logger = wandb
 
     # training loop
@@ -210,11 +232,15 @@ def main(cfg: DictConfig):
     t0 = time.time()
     local_iter_num = 0  # number of iterations in the lifetime of this process
     running_mfu = -1.0
+    stop_reason = "max_iters"
     while True:
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num, cfg)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+        if hasattr(optimizer, "scale_lr"):
+            optimizer.scale_lr(lr / cfg.lr)
+        else:
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
         # evaluate the loss on train/val sets and write checkpoints
         if iter_num % cfg.eval_interval == 0:
@@ -229,21 +255,50 @@ def main(cfg: DictConfig):
                     output = [None] * ddp_world_size
                     th.distributed.all_gather_object(output, losses[key])
                     losses[key] = sum(output) / ddp_world_size
+            val_loss = losses["loss/val"]
             if master_process:
                 logger.info(
                     "step {}: train loss {:.4f}, val loss {:.4f}".format(
                         iter_num,
                         losses["loss/train"],
-                        losses["loss/val"],
+                        val_loss,
                     )
                 )
-                if iter_num > 0:
+                if online_logger is not None:
+                    epochs = iter_num * tokens_per_iter / len(train_dataset)
+                    online_logger.log(
+                        {
+                            "other/iter": iter_num,
+                            "other/lr": lr,
+                            "other/mfu": running_mfu * 100,
+                            "other/epochs": epochs,
+                            **losses,
+                        }
+                    )
+
+            if iter_num > 0:
+                is_best_loss = val_loss < best_val_loss
+                has_early_stopping_improvement = (
+                    val_loss < early_stopping_best_val_loss * (1 - cfg.early_stopping_min_delta)
+                )
+                if is_best_loss:
+                    previous_best_val_loss = best_val_loss
+                    best_val_loss = val_loss
+                if has_early_stopping_improvement:
+                    early_stopping_best_val_loss = val_loss
+                    early_stopping_bad_eval_count = 0
+                elif cfg.early_stopping and iter_num >= cfg.early_stopping_warmup_iters:
+                    early_stopping_bad_eval_count += 1
+
+                if master_process:
                     checkpoint = {
                         "iter_num": iter_num,
                         "model": raw_model.state_dict(),
                         "optimizer": optimizer.state_dict(),
-                        "best_val_loss": losses["loss/val"],
+                        "best_val_loss": best_val_loss,
                         "best_metric_score": best_metric_score,
+                        "early_stopping_bad_eval_count": early_stopping_bad_eval_count,
+                        "early_stopping_best_val_loss": early_stopping_best_val_loss,
                         "model_config": raw_model.config,
                         "vocab": vocab.stoi,
                         "model_type": str(model_type),
@@ -251,24 +306,33 @@ def main(cfg: DictConfig):
                     }
                     th.save(checkpoint, out_dir / "recent_model.pt")
                     logger.info("Saved the most recent model.")
-                    if losses["loss/val"] < best_val_loss:
+                    if is_best_loss:
                         th.save(checkpoint, out_dir / "best_model.pt")
                         logger.info(
-                            f"Saved the best model: {best_val_loss} => {losses['loss/val']}"
+                            f"Saved the best model: {previous_best_val_loss} => {val_loss}"
                         )
-                        best_val_loss = losses["loss/val"]
+                    if cfg.early_stopping:
+                        logger.info(
+                            "Early stopping bad evals: {}/{}".format(
+                                early_stopping_bad_eval_count,
+                                cfg.early_stopping_patience,
+                            )
+                        )
 
-                    if online_logger is not None:
-                        epochs = iter_num * tokens_per_iter / len(train_dataset)
-                        online_logger.log(
-                            {
-                                "other/iter": iter_num,
-                                "other/lr": lr,
-                                "other/mfu": running_mfu * 100,
-                                "other/epochs": epochs,
-                                **losses,
-                            }
+                if (
+                    cfg.early_stopping
+                    and iter_num >= cfg.early_stopping_warmup_iters
+                    and early_stopping_bad_eval_count >= cfg.early_stopping_patience
+                ):
+                    stop_reason = "early_stopping"
+                    if master_process:
+                        logger.info(
+                            "Early stopping triggered at iter {} with best val loss {:.4f}.".format(
+                                iter_num,
+                                best_val_loss,
+                            )
                         )
+                    break
 
         # forward backward update, with optional gradient accumulation to simulate larger batch size
         # and using the GradScaler if data type is float16
@@ -280,6 +344,7 @@ def main(cfg: DictConfig):
                 # looking at the source of that context manager, it just toggles this variable
                 model.require_backward_grad_sync = micro_step == cfg.gradient_accumulation_steps - 1
             with ctx:
+                th.compiler.cudagraph_mark_step_begin()
                 if isinstance(X, tuple):
                     output = model(input_ids=X[0], decoder_input_ids=X[1], labels=Y)
                 else:
@@ -324,7 +389,36 @@ def main(cfg: DictConfig):
 
         # termination conditions
         if iter_num > cfg.max_iters:
+            stop_reason = "max_iters"
             break
+
+    # save a final checkpoint regardless of eval_interval
+    if master_process:
+        final_model_fp = out_dir / "final_model.pt"
+        final_checkpoint = {
+            "iter_num": iter_num,
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "best_val_loss": best_val_loss,
+            "best_metric_score": best_metric_score,
+            "early_stopping_bad_eval_count": early_stopping_bad_eval_count,
+            "early_stopping_best_val_loss": early_stopping_best_val_loss,
+            "stop_reason": stop_reason,
+            "model_config": raw_model.config,
+            "vocab": vocab.stoi,
+            "model_type": str(model_type),
+            "wandb_path": wandb_run.path if wandb_run is not None else None,
+        }
+        th.save(final_checkpoint, final_model_fp)
+        logger.info(f"Saved final model checkpoint at iter {iter_num} ({stop_reason}).")
+        if wandb_run is not None:
+            wandb_run.summary["stop_reason"] = stop_reason
+            wandb_run.summary["stopped_iter"] = iter_num
+            wandb_run.summary["best_val_loss"] = best_val_loss
+            wandb_run.summary["final_checkpoint_path"] = str(final_model_fp)
+
+    if wandb_run is not None and master_process:
+        wandb_run.finish()
 
     if ddp:
         destroy_process_group()

@@ -250,6 +250,9 @@ class MeasurementData:
     @staticmethod
     @MatchAndRevise(prefix="Blood Pressure")
     def process_blood_pressure(bp_df: pl.DataFrame) -> pl.DataFrame:
+        if bp_df.is_empty():
+            return bp_df
+
         return (
             bp_df.with_columns(
                 code=pl.when(pl.col.numeric_value.is_null()).then(

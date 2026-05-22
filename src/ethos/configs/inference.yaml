@@ -22,5 +22,7 @@ timeout: 300
 
 seed: 42
 
+resume: false # if true, skip data_idx values already present in output_dir
+
 hydra:
   output_subdir: null

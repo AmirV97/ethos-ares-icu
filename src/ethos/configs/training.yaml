@@ -9,16 +9,23 @@ resume: false
 wandb_log: false
 wandb_project: "ethos"
 wandb_run_name: "ethos_run"
+wandb_tags: []
 # training parameters
 gradient_accumulation_steps: 40 # Assuming 5 * 8
 batch_size: 32
+early_stopping: false
+early_stopping_patience: 10
+early_stopping_min_delta: 0.0
+early_stopping_warmup_iters: 0
 # model parameters
 n_positions: 2048
 n_layer: 1
 n_head: 4
 n_embd: 64
+n_kv_head: -1  # -1 = same as n_head (full MHA); set e.g. 3 for GQA with n_head=12
 dropout: 0
 activation: "gelu"
+use_modern_arch: false
 # optimizer parameters
 max_iters: 100000
 lr: 0.0006 # Learning rate
@@ -26,6 +33,8 @@ weight_decay: 0.1
 beta1: 0.9
 beta2: 0.95
 grad_clip: 1.0
+muon_lr: 0.02
+muon_momentum: 0.95
 # learning rate schedule
 warmup_iters: 2000
 lr_decay_iters: 50000
@@ -35,6 +44,7 @@ backend: "nccl" # "nccl", "gloo"
 device: "cpu" # "cuda", "cpu"
 dtype: "bfloat16" # "float32", "bfloat16", "float16"
 no_compile: false
+compile_backend: "cudagraphs"
 
 hydra:
   output_subdir: null

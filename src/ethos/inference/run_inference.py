@@ -66,6 +66,20 @@ def main(cfg: DictConfig):
 
     np.random.seed(cfg.seed)
     indices = np.random.choice(np.arange(len(dataset)), n_samples, replace=False)
+
+    if cfg.resume:
+        existing = sorted(result_dir.glob("*.parquet"))
+        if existing:
+            import polars as pl
+            done = set(
+                pl.concat([pl.read_parquet(fp, columns=["data_idx"], glob=False) for fp in existing])[
+                    "data_idx"
+                ].to_list()
+            )
+            indices = np.array([i for i in indices if i not in done])
+            n_samples = len(indices)
+            logger.info(f"Resuming: {len(done):,} samples already done, {n_samples:,} remaining.")
+
     chunk_num = n_samples // cfg.chunksize
     subsets = [subset_indices for subset_indices in np.array_split(indices, chunk_num)]
 

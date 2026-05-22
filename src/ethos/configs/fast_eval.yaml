@@ -1,0 +1,20 @@
+model_fp: ???
+input_dir: ???
+output_dir: results/fast_eval
+model_tag: whole_data    # "whole_data" or "icu_only" — used for wandb tags and output naming
+
+task: icu_mortality
+
+sanity_n: 100            # random patients for structural sanity check (rep=1, saves tokens)
+fast_n: 200              # stratified patients for AUROC estimate (n//2 per outcome class)
+fast_rep_num: 4          # repetitions per patient in fast mode
+
+temperature: 1.0
+seed: 42
+no_compile: false
+device: cuda
+
+wandb_project: "ETHOS replicate"
+
+hydra:
+  output_subdir: null
